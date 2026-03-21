@@ -1,0 +1,469 @@
+# NCCL 超时检测代码补丁
+
+## 补丁1: proxy.h - 添加超时检测数据结构
+
+```diff
+--- a/src/include/proxy.h
++++ b/src/include/proxy.h
+@@ -120,6 +120,11 @@ struct ncclProxySubArgs {
+   size_t transSize;
+   uint64_t workCounter;
+ 
++  // Timeout detection fields
++  uint64_t startTime;        // Operation start time (microseconds)
++  uint64_t lastActiveTime;   // Last active time (microseconds)
++  int timeoutDetected;       // Timeout detected flag
++
+   void* recvRequestsCache[NCCL_STEPS];
+   int recvRequestsSubCount;
+ };
+@@ -154,6 +159,10 @@ struct ncclProxyArgs {
+   int nChannels;
+   int nPeers;
+ 
++  // Timeout detection fields
++  uint64_t opStartTime;      // Overall operation start time
++  int timeoutLogged;         // Timeout logged flag
++
+   int idle;
+ 
+   // Element linking
+@@ -315,4 +324,36 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm);
+ ncclResult_t ncclProxyShmUnlink(struct ncclComm* comm);
+ ncclResult_t ncclProxyDestroy(struct ncclComm* comm);
++
++// Timeout detection utility functions
++
++// Get current time in microseconds
++static inline uint64_t ncclProxyGetTimeUs() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
++}
++
++// Timeout configuration structure
++struct ncclProxyTimeoutConfig {
++  int enabled;               // Whether timeout is enabled
++  uint64_t timeoutUs;        // Timeout in microseconds
++  int logOnly;               // Only log, don't fail
++  uint64_t checkIntervalUs;  // Check interval in microseconds
++};
++
++// Forward declaration of timeout parameter functions
++int64_t ncclParamProxyTimeoutMs();
++int64_t ncclParamProxyTimeoutLogOnly();
++int64_t ncclParamProxyTimeoutCheckInterval();
++
++// Get timeout configuration
++static inline void ncclProxyGetTimeoutConfig(struct ncclProxyTimeoutConfig* config) {
++  config->enabled = ncclParamProxyTimeoutMs() > 0;
++  config->timeoutUs = (uint64_t)ncclParamProxyTimeoutMs() * 1000;
++  config->logOnly = ncclParamProxyTimeoutLogOnly();
++  config->checkIntervalUs = (uint64_t)ncclParamProxyTimeoutCheckInterval() * 1000;
++}
++
+ #endif
+```
+
+## 补丁2: proxy.cc - 添加超时检测逻辑
+
+```diff
+--- a/src/proxy.cc
++++ b/src/proxy.cc
+@@ -45,6 +45,16 @@ NCCL_PARAM(ProxyAppendBatchSize, "PROXY_APPEND_BATCH_SIZE", 16);
+ NCCL_PARAM(CreateThreadContext, "CREATE_THREAD_CONTEXT", 0);
+ NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
+ NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPEND_OP_FREQ", 8);
++
++// Timeout detection parameters
++// NCCL_PROXY_TIMEOUT_MS: Timeout in milliseconds, 0 to disable
++NCCL_PARAM(ProxyTimeoutMs, "PROXY_TIMEOUT_MS", 0);
++
++// NCCL_PROXY_TIMEOUT_LOG_ONLY: 1=only log, 0=return error on timeout
++NCCL_PARAM(ProxyTimeoutLogOnly, "PROXY_TIMEOUT_LOG_ONLY", 1);
++
++// NCCL_PROXY_TIMEOUT_CHECK_INTERVAL: Check interval in milliseconds
++NCCL_PARAM(ProxyTimeoutCheckInterval, "PROXY_TIMEOUT_CHECK_INTERVAL", 1000);
+ 
+ static bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks) {
+   if (pattern == ncclPatternRing || pattern == ncclPatternRingTwice) return true;
+@@ -353,6 +363,55 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
+   return ncclSuccess;
+ }
+ 
++// Timeout detection helper functions
++
++// Check and log timeout for a sub-operation
++static void ncclProxyCheckTimeout(struct ncclProxyArgs* args, struct ncclProxySubArgs* sub,
++                                   int subIndex, const char* transportName, 
++                                   const char* stage) {
++  struct ncclProxyTimeoutConfig config;
++  ncclProxyGetTimeoutConfig(&config);
++  
++  if (!config.enabled) return;
++  
++  uint64_t currentTime = ncclProxyGetTimeUs();
++  uint64_t elapsed = currentTime - sub->lastActiveTime;
++  
++  if (elapsed > config.timeoutUs) {
++    // Timeout detected
++    if (!sub->timeoutDetected) {
++      sub->timeoutDetected = 1;
++      
++      // Calculate total operation time
++      uint64_t totalElapsed = currentTime - sub->startTime;
++      
++      WARN("NCCL Proxy Timeout Detected! "
++           "Transport: %s, Stage: %s, "
++           "Sub: %d/%d, Peer: %d, Channel: %d, "
++           "Progress: posted=%lu transmitted=%lu received=%lu done=%lu nsteps=%lu, "
++           "Elapsed: %lu ms (stage), %lu ms (total), "
++           "Timeout: %lu ms",
++           transportName, stage,
++           subIndex, args->nsubs, sub->peer, sub->channelId,
++           sub->posted, sub->transmitted, sub->received, sub->done, sub->nsteps,
++           elapsed / 1000, totalElapsed / 1000,
++           config.timeoutUs / 1000);
++    }
++    
++    // Update last active time to avoid log spam
++    sub->lastActiveTime = currentTime;
++  }
++}
++
++// Update active time for a sub-operation
++static inline void ncclProxyUpdateActiveTime(struct ncclProxySubArgs* sub) {
++  sub->lastActiveTime = ncclProxyGetTimeUs();
++  sub->timeoutDetected = 0;  // Reset timeout flag
++}
++
++// Initialize timeout fields for new operation
++static inline void ncclProxyInitTimeout(struct ncclProxyArgs* args, uint64_t startTime) {
++  args->opStartTime = startTime;
++  args->timeoutLogged = 0;
++}
++
+ static ncclResult_t ProxyAppend(struct ncclProxyProgressState* state, struct ncclProxyOp* op) {
+   struct ncclProxyConnection* connection = op->connection;
+   int shared = connection->shared;
+@@ -377,6 +436,18 @@ static ncclResult_t ProxyAppend(struct ncclProxyProgressState* state, struct ncc
+       DEBUG_PROXY_PRINT("Insert  %5ld (%d/%5ld) as first element\n", OP_INDEX(args), shared, args->opCount);
+       state->active = args;
+     } else {
++      // Initialize timeout fields for new operation
++      uint64_t currentTime = ncclProxyGetTimeUs();
++      ncclProxyInitTimeout(args, currentTime);
++      
++      // Initialize all sub-operations
++      for (int i = 0; i < args->nsubs; i++) {
++        struct ncclProxySubArgs* sub = &args->subs[i];
++        sub->startTime = currentTime;
++        sub->lastActiveTime = currentTime;
++        sub->timeoutDetected = 0;
++      }
++
+       // Append element at the end of the list
+       struct ncclProxyArgs* last = state->active;
+       while (last->next) last = last->next;
+@@ -400,9 +471,59 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
+ static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle) {
+   struct ncclProxyArgs* prevOp = NULL;
+   struct ncclProxyArgs* op = opStart;
+   ncclResult_t status = ncclSuccess;
++  
++  // Get timeout configuration
++  struct ncclProxyTimeoutConfig timeoutConfig;
++  ncclProxyGetTimeoutConfig(&timeoutConfig);
++  uint64_t currentTime = ncclProxyGetTimeUs();
++  static uint64_t lastCheckTime = 0;
++  static __thread int checkInitialized = 0;
++  
++  if (!checkInitialized) {
++    lastCheckTime = currentTime;
++    checkInitialized = 1;
++  }
++  
++  int shouldCheckTimeout = timeoutConfig.enabled && 
++                           (currentTime - lastCheckTime > timeoutConfig.checkIntervalUs);
++  
++  if (shouldCheckTimeout) {
++    lastCheckTime = currentTime;
++  }
++
+   while (op) {
+     if (op->state == ncclProxyOpNone) return ncclInternalError;
+     TIME_START(0); TIME_START(1);
+     ncclResult_t ret = op->progress(proxyState, op);
+     if (op->idle) { TIME_STOP(1); TIME_CANCEL(0); } else { TIME_CANCEL(1); TIME_STOP(0); }
+     *idle &= op->idle;
++    
++    // Timeout detection
++    if (shouldCheckTimeout && timeoutConfig.enabled && op->state == ncclProxyOpProgress) {
++      // Determine transport name
++      const char* transportName = "UNKNOWN";
++      if (op->nsubs > 0 && op->subs[0].connection) {
++        int transport = op->subs[0].connection->transport;
++        switch(transport) {
++          case TRANSPORT_P2P: transportName = "P2P"; break;
++          case TRANSPORT_SHM: transportName = "SHM"; break;
++          case TRANSPORT_NET: transportName = "NET"; break;
++          case TRANSPORT_COLLNET: transportName = "COLLNET"; break;
++          default: transportName = "UNKNOWN"; break;
++        }
++      }
++      
++      // Check each sub-operation
++      for (int i = 0; i < op->nsubs; i++) {
++        struct ncclProxySubArgs* sub = &op->subs[i];
++        
++        if (sub->done == sub->nsteps) continue;  // Completed
++        
++        // Determine current stage
++        const char* stage = "UNKNOWN";
++        if (sub->posted < sub->nsteps) {
++          stage = "POSTING";
++        } else if (sub->transmitted < sub->posted) {
++          stage = "TRANSMITTING";
++        } else if (sub->received < sub->transmitted) {
++          stage = "RECEIVING";
++        } else if (sub->done < sub->received) {
++          stage = "WAITING_ACK";
++        }
++        
++        ncclProxyCheckTimeout(op, sub, i, transportName, stage);
++      }
++    }
++
+     if (op->state == ncclProxyOpNone || ret != ncclSuccess) {
+       //track first error that occured
+       if (ret != ncclSuccess && status == ncclSuccess) status = ret;
+```
+
+## 补丁3: net.cc - 更新Network Transport活跃时间
+
+```diff
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -1100,6 +1100,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct
+     for (int s=0; s<args->nsubs; s++) {
+       struct ncclProxySubArgs* sub = args->subs+s;
+       struct sendNetResources* resources = (struct sendNetResources*) (sub->connection->transportResources);
++      
++      // Update active time for initialization
++      ncclProxyUpdateActiveTime(sub);
+       // Round to next multiple of sliceSteps
+       sub->base = ROUNDUP(resources->step, args->chunkSteps);
+       // Set step base for next op
+@@ -1129,6 +1132,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct
+       // Post buffers to the GPU
+       if (sub->posted < sub->nsteps && sub->posted < sub->done + maxDepth) {
+         ncclProfilerStartSendProxyStepEvent(s, args, postedStepId);
++        ncclProxyUpdateActiveTime(sub);
+         int buffSlot = (sub->base+sub->posted)%NCCL_STEPS;
+         if (resources->shared) {
+           if (!sub->reg) {
+@@ -1200,6 +1204,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct
+             if (!checkedNetAttr++)
+               setXferNetAttrs(proxyState, args, 1);
+             NCCLCHECK(proxyState->ncclNet->isend(resources->netSendComm, buff, size, resources->tpRank, sub->sendMhandle, phandle, sub->requests+buffSlot));
+             if (sub->requests[buffSlot] != NULL) {
++              ncclProxyUpdateActiveTime(sub);
+               TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] Isend posted, req %p, buff %p, size %d, proto %d, myRank %d, channelId %d, mhandle %p", sub->transmitted, buffSlot, sub->nsteps, sub->requests[buffSlot], buff, size, p, proxyState->tpRank, sub->channelId, sub->sendMhandle);
+               sub->transSize = size;
+               sub->transmitted += args->sliceSteps;
+@@ -1215,6 +1220,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct
+         int done;
+         int size;
+         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+         NCCLCHECK(proxyState->ncclNet->test(sub->requests[buffSlot], &done, &size));
+         if (done) {
++          ncclProxyUpdateActiveTime(sub);
+           // Make sure size is reset to -1 before we update the head.
+           connFifo[buffSlot].size = -1;
+           std::atomic_thread_fence(std::memory_order_seq_cst);
+@@ -1257,6 +1263,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+       struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
+       maxRecvs = resources->maxRecvs;
+       recvComm = resources->netRecvComm;
++      
++      // Update active time for initialization
++      ncclProxyUpdateActiveTime(sub);
+       // Round to next multiple of sliceSteps
+       sub->base = ROUNDUP(resources->step, args->chunkSteps);
+       // Set step base for next op
+@@ -1320,6 +1329,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+         bool ignoreCompletion = ncclParamNetOptionalRecvCompletion() && ((args->protocol == NCCL_PROTO_LL128) || (args->protocol == NCCL_PROTO_LL)) && (subCount == 1);
+         if (!checkedNetAttr++)
+           setXferNetAttrs(proxyState, args, 0);
+         if (ignoreCompletion) *requestPtr = (void *)NCCL_NET_OPTIONAL_RECV_COMPLETION;
+         NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, phandles, requestPtr));
+         if (*requestPtr) {
++          ncclProxyUpdateActiveTime(subGroup);
+           subGroup->recvRequestsCache[step%NCCL_STEPS] = *requestPtr;
+           subGroup->recvRequestsSubCount = subCount;
+           for (int i=0; i<subGroup->groupSize; i++) {
+@@ -1340,6 +1350,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+         int done;
+         void* ptrs[NCCL_PROXY_MAX_SUBS];
+         int sizes[NCCL_PROXY_MAX_SUBS];
+         void* mhandles[NCCL_PROXY_MAX_SUBS];
+         for (int i=0; i<NCCL_PROXY_MAX_SUBS; i++) sizes[i] = 0;
+         NCCLCHECK(proxyState->ncclNet->test(subGroup->requests[step%NCCL_STEPS], &done, sizes));
+         if (done) {
++          ncclProxyUpdateActiveTime(subGroup);
+           int needFlush = 0;
+           int totalSize = 0;
+           for (int i=0; i<NCCL_PROXY_MAX_SUBS; i++) totalSize += sizes[i];
+@@ -1391,6 +1402,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+         void* request = subGroup->requests[step%NCCL_STEPS];
+         if (request) NCCLCHECK(proxyState->ncclNet->test(request, &done, NULL));
+         if (done) {
++          ncclProxyUpdateActiveTime(subGroup);
+           for (int i=0; i<subGroup->groupSize; i++) {
+             struct ncclProxySubArgs* sub = subGroup + i;
+             int transmittedStepId = sub->transmitted;
+@@ -1425,6 +1437,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct
+               // the multirecv requests are only cached in the first sub.
+               if (proxyState->ncclNet->irecvConsumed)
+                 NCCLCHECK(proxyState->ncclNet->irecvConsumed(resources->netRecvComm, subGroup->recvRequestsSubCount, subGroup->recvRequestsCache[sub->done%NCCL_STEPS]));
+               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
+             }
++            ncclProxyUpdateActiveTime(sub);
+             int doneStepId = sub->done;
+             sub->done += args->sliceSteps;
+             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);
+```
+
+## 补丁4: shm.cc - 更新SHM Transport活跃时间
+
+```diff
+--- a/src/transport/shm.cc
++++ b/src/transport/shm.cc
+@@ -280,6 +280,9 @@ static ncclResult_t shmSendProxyProgress(struct ncclProxyState* proxyState, str
+   if (args->state == ncclProxyOpReady) {
+     for (int s=0; s<args->nsubs; s++) {
+       struct ncclProxySubArgs* sub = args->subs+s;
++      
++      // Update active time for initialization
++      ncclProxyUpdateActiveTime(sub);
+       struct shmProxyInfo* resources = (struct shmProxyInfo*) (sub->connection->transportResources);
+       // Round to next multiple of sliceSteps
+       sub->base = ROUNDUP(resources->step, args->chunkSteps);
+@@ -302,6 +305,7 @@ static ncclResult_t shmSendProxyProgress(struct ncclProxyState* proxyState, str
+         volatile uint64_t* recvTail = &resources->ceRecvMem->tail;
+         // Check GPU has sent everything
+         if ((*recvTail > sub->base+sub->transmitted)) {
++          ncclProxyUpdateActiveTime(sub);
+           int size = connFifo[buffSlot].size;
+           CUDACHECK(cudaMemcpyAsync(resources->shmFifo+buffSlot*stepSize, resources->devFifo+buffSlot*stepSize, size, cudaMemcpyDeviceToHost, resources->stream));
+           CUDACHECK(cudaEventRecord(resources->events[buffSlot], resources->stream));
+@@ -313,6 +317,7 @@ static ncclResult_t shmSendProxyProgress(struct ncclProxyState* proxyState, str
+         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+         cudaError_t res = CUDACLEARERROR(cudaEventQuery(resources->events[buffSlot]));
+         if (res != cudaErrorNotReady) CUDACHECK(res);
+         if (res == cudaSuccess) {
++          ncclProxyUpdateActiveTime(sub);
+           sub->done += args->sliceSteps;
+           // Notify SHM
+           resources->recvMem->tail = sub->base + sub->done;
+@@ -333,6 +338,9 @@ static ncclResult_t shmRecvProxyProgress(struct ncclProxyState* proxyState, str
+   if (args->state == ncclProxyOpReady) {
+     for (int s=0; s<args->nsubs; s++) {
+       struct ncclProxySubArgs* sub = args->subs+s;
++      
++      // Update active time for initialization
++      ncclProxyUpdateActiveTime(sub);
+       struct shmProxyInfo* resources = (struct shmProxyInfo*) (sub->connection->transportResources);
+       // Round to next multiple of sliceSteps
+       sub->base = ROUNDUP(resources->step, args->chunkSteps);
+@@ -355,6 +363,7 @@ static ncclResult_t shmRecvProxyProgress(struct ncclProxyState* proxyState, str
+         volatile uint64_t* recvTail = &resources->recvMem->tail;
+         // Check data is ready in SHM
+         if ((*recvTail > sub->base+sub->transmitted)) {
++          ncclProxyUpdateActiveTime(sub);
+           int size = connFifo[buffSlot].size;
+           CUDACHECK(cudaMemcpyAsync(resources->devFifo+buffSlot*stepSize, resources->shmFifo+buffSlot*stepSize, size, cudaMemcpyHostToDevice, resources->stream));
+           CUDACHECK(cudaEventRecord(resources->events[buffSlot], resources->stream));
+@@ -366,6 +375,7 @@ static ncclResult_t shmRecvProxyProgress(struct ncclProxyState* proxyState, str
+         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+         cudaError_t res = CUDACLEARERROR(cudaEventQuery(resources->events[buffSlot]));
+         if (res != cudaErrorNotReady) CUDACHECK(res);
+         if (res == cudaSuccess) {
++          ncclProxyUpdateActiveTime(sub);
+           sub->done += args->sliceSteps;
+           // Notify GPU
+           resources->ceRecvMem->tail = sub->base + sub->done;
+```
+
+## 补丁5: p2p.cc - 更新P2P Transport活跃时间
+
+```diff
+--- a/src/transport/p2p.cc
++++ b/src/transport/p2p.cc
+@@ -660,6 +660,9 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, str
+   if (args->state == ncclProxyOpReady) {
+     for (int s=0; s<args->nsubs; s++) {
+       struct ncclProxySubArgs* sub = args->subs+s;
++      
++      // Update active time for initialization
++      ncclProxyUpdateActiveTime(sub);
+       struct p2pShmProxyInfo* resources = (struct p2pShmProxyInfo*) (sub->connection->transportResources);
+       // Round to next multiple of sliceSteps
+       sub->base = ROUNDUP(resources->step, args->chunkSteps);
+@@ -682,6 +685,7 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, str
+         volatile uint64_t* recvTail = &resources->ceRecvMem->tail;
+         // Check GPU has sent everything
+         if ((*recvTail > sub->base+sub->transmitted)) {
++          ncclProxyUpdateActiveTime(sub);
+           int size = connFifo[buffSlot].size;
+           CUDACHECK(cudaMemcpyAsync(resources->recvFifo+buffSlot*stepSize, resources->ceDevBuff+buffSlot*stepSize, size, cudaMemcpyDeviceToDevice, resources->stream));
+           CUDACHECK(cudaEventRecord(resources->events[buffSlot], resources->stream));
+@@ -693,6 +697,7 @@ static ncclResult_t p2pSendProxyProgress(struct ncclProxyState* proxyState, str
+         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+         cudaError_t res = CUDACLEARERROR(cudaEventQuery(resources->events[buffSlot]));
+         if (res != cudaErrorNotReady) CUDACHECK(res);
+         if (res == cudaSuccess) {
++          ncclProxyUpdateActiveTime(sub);
+           sub->done += args->sliceSteps;
+           // Notify SHM
+           resources->shm->recvMem.tail = sub->base + sub->done;
+```
+
+## 应用补丁
+
+### 方法1: 使用 git apply
+
+```bash
+cd /root/workspace/nccl
+
+# 保存每个补丁到文件
+cat > proxy.h.patch << 'EOF'
+[patch content]
+EOF
+
+# 应用补丁
+git apply proxy.h.patch
+git apply proxy.cc.patch
+git apply net.cc.patch
+git apply shm.cc.patch
+git apply p2p.cc.patch
+```
+
+### 方法2: 手动修改
+
+参考上面的diff，手动编辑每个文件。
+
+### 编译
+
+```bash
+cd /root/workspace/nccl
+make clean
+make -j$(nproc)
+```
+
+### 验证
+
+```bash
+# 检查超时检测参数是否生效
+NCCL_DEBUG=INFO NCCL_PROXY_TIMEOUT_MS=1000 ./your_test_program 2>&1 | grep -i timeout
+```

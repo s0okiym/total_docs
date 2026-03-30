@@ -50,13 +50,13 @@ graph TB
         Cpp_Client[C++ Client]
     end
 
-    subgraph Server Layer
+    subgraph Server_Layer [Server Layer]
         HTTP_Server[HTTP Server<br/>evhtp]
         gRPC_Server[gRPC Server]
         Metrics_Server[Metrics Server]
     end
 
-    subgraph Core Layer
+    subgraph Core_Layer [Core Layer]
         TritonServer[Triton Server]
         ModelRepoManager[Model Repository Manager]
         BackendManager[Backend Manager]
@@ -64,13 +64,13 @@ graph TB
         RateLimiter[Rate Limiter]
     end
 
-    subgraph Scheduler Layer
+    subgraph Scheduler_Layer [Scheduler Layer]
         DynamicBatcher[Dynamic Batch Scheduler]
         SequenceBatcher[Sequence Batch Scheduler]
         EnsembleScheduler[Ensemble Scheduler]
     end
 
-    subgraph Backend Layer
+    subgraph Backend_Layer [Backend Layer]
         TensorRT_BE[TensorRT Backend]
         TensorFlow_BE[TensorFlow Backend]
         PyTorch_BE[PyTorch Backend]
@@ -79,7 +79,7 @@ graph TB
         Custom_BE[Custom Backends]
     end
 
-    subgraph Model Repository
+    subgraph Model_Repository_Sub [Model Repository]
         Model_Repo[Model Repository<br/>File System]
     end
 
@@ -102,9 +102,10 @@ graph TB
     ModelRepoManager --> SequenceBatcher
     ModelRepoManager --> EnsembleScheduler
 
-    DynamicBatcher --> Backend Layer
-    SequenceBatcher --> Backend Layer
-    EnsembleScheduler --> Backend Layer
+    %% 这里修改为连接到具体的子图 ID
+    DynamicBatcher --> Backend_Layer
+    SequenceBatcher --> Backend_Layer
+    EnsembleScheduler --> Backend_Layer
 ```
 
 ### 2.2 核心组件关系

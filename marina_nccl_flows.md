@@ -729,7 +729,7 @@ sequenceDiagram
 
     Note over K,Next: === Reduce-Scatter 阶段 (nRanks-1 步) ===
 
-    loop "j = 0; j < nRanks-1; j++"
+    loop j = 0..nRanks-2
         K->>K: offset = (ringIx + nRanks - j) % nRanks × chunkSize
         alt j == 0
             K->>Next: prims.directSend(offset, nelem)
@@ -742,7 +742,7 @@ sequenceDiagram
 
     Note over K,Next: === AllGather 阶段 (nRanks-1 步) ===
 
-    loop "j = 1; j < nRanks; j++"
+    loop j = 1..nRanks-1
         K->>K: offset = (ringIx + nRanks - j) % nRanks × chunkSize
         alt j < nRanks-1
             Prev->>K: prims.directRecvCopyDirectSend(offset, nelem)
